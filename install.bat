@@ -1,8 +1,6 @@
 @echo off
 chcp 65001
 cd /d "%~dp0"
-call .venv\Scripts\activate.bat
-python -c "import os; print('Python RUN DIR:', os.getcwd())"
 echo    CURRENT DIR: %CD%
 timeout /t 2 /nobreak >nul
 
@@ -16,10 +14,16 @@ echo.
 
 python.exe -m venv .venv
 
-call  :: created at: 2025-08-10T23:30:55Z
+call .venv\Scripts\activate
+echo.
+echo    CURRENT DIR: %CD%
+echo.
+python.exe -m pip -V
+echo.
+echo.
+echo.
 
-:: SETUP PythonService .venv\Scripts\activate
+python.exe -m pip install -U pip 
 
-pip install -U pip 
 
-pip install -U -r requirements.txt
+python.exe -m pip install -r requirements.txt
