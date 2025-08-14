@@ -35,7 +35,7 @@ if exist ".venv" (
     )
 ) else (
     echo .venv bulunamadi. Yeni bir sanal ortam olusturuluyor...
-    python -m venv .venv
+    python.exe -m venv .venv
     if errorlevel 1 (
         echo venv olusturma sirasinda hata olustu.
         echo Lutfen Python ve pip'in kurulu oldugundan emin olun.
