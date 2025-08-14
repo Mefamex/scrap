@@ -26,11 +26,7 @@ from selenium.webdriver.remote.webelement import WebElement
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from webdriver_manager.chrome import ChromeDriverManager
-import asyncio
-import logging
-import time
-import os
-import base64
+import asyncio, logging, time, os, base64, platform, subprocess, psutil
 from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 
@@ -40,94 +36,126 @@ from src.settings import settings
 logger = logging.getLogger(__name__)
 
 
+def get_default_user_data_dir() -> str:
+    """Chrome'un varsayılan kullanıcı veri dizinini otomatik olarak bulur."""
+    system = platform.system()
+    if system == "Windows":
+        local_app_data = os.getenv("LOCALAPPDATA", "")
+        if not local_app_data: raise RuntimeError("LOCALAPPDATA ortam değişkeni bulunamadı.")
+        return os.path.join(local_app_data, "Google", "Chrome", "User Data")
+    elif system == "Darwin": return os.path.expanduser("~/Library/Application Support/Google/Chrome")
+    elif system == "Linux": return os.path.expanduser("~/.config/google-chrome")
+    else:  raise RuntimeError(f"Desteklenmeyen işletim sistemi: {system}")
+def _terminate_chrome_tasks():
+    """Sistemden açık Chrome görevlerini sonlandırır."""
+    try:
+        chrome_processes = [p for p in psutil.process_iter(['name']) if p.info['name'] == 'chrome.exe']
+        if not chrome_processes: return
+        for proc in chrome_processes: proc.terminate()
+        logger.info("Açık Chrome görevleri sonlandırıldı.")
+    except Exception as e: logger.error(f"Chrome görevlerini sonlandırırken hata oluştu: {e}")
 
 class BrowserManager:
-    """Tarayıcı yöneticisi sınıfı"""
-    
+    """Singleton class to manage the Selenium browser instance."""
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(BrowserManager, cls).__new__(cls)
+            # __init__ metodunun sadece ilk oluşturmada çalışmasını sağla
+            cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
-        self.driver: webdriver.Chrome
+        """Tarayıcı yöneticisi sınıfı"""
+        if self._initialized: return
+        self.driver: Optional[webdriver.Chrome] = None
         self.is_initialized = False
         self.config = settings.browser_config
         self.start_time = time.time()
         self.session_count = 0
+        self._initialized = True
         
     async def initialize_browser(self) -> bool:
         """Tarayıcıyı başlat ve açık tut"""
+        if self.is_initialized:
+            logger.info("Browser already initialized.")
+            return True
         try:
+            chromedriver_path = settings._get_chrome_driver_path()
+            _terminate_chrome_tasks()
+
             chrome_options = Options()
-            
-            # Temel ayarlar
-            if self.config.headless: chrome_options.add_argument("--headless=new")
-            
-            # Pencere boyutu
-            width, height = self.config.window_size
-            chrome_options.add_argument(f"--window-size={width},{height}")
-            
-            # Performans optimizasyonları
+
+            user_data_dir = os.path.join(settings.app_base_dir, "chrome_profiles", "BOTum_ben")
+            os.makedirs(user_data_dir, exist_ok=True)
+            logger.info(f"Chrome user data dir: {user_data_dir}")
+            chrome_options.add_argument(f"--user-data-dir={user_data_dir}")
+            chrome_options.add_argument("--profile-directory=Default")
+            chrome_options.add_argument("--start-maximized")
+
+            # Temel güvenilir / performans flag'leri
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--disable-web-security")
-            chrome_options.add_argument("--disable-features=VizDisplayCompositor")
-            chrome_options.add_argument("--disable-extensions")
-            chrome_options.add_argument("--disable-plugins")
-            
-            # Gizlilik ve güvenlik
+
+            # chrome_options.add_argument("--disable-gpu")
+
+            # Remote debugging FLAG EKLEME (DevTools listening mesajı normal ve zararsız)
+
+            # Bot / otomasyon gizleme
             chrome_options.add_experimental_option('useAutomationExtension', False)
             chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
             chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-            
-            # User Agent
-            if self.config.user_agent: chrome_options.add_argument(f"--user-agent={self.config.user_agent}")
-            else: chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            
-            # Resimler ve JavaScript
-            prefs = {}
-            if self.config.disable_images:  prefs["profile.managed_default_content_settings.images"] = 2
-            if self.config.disable_javascript:  prefs["profile.managed_default_content_settings.javascript"] = 2
-            
-            if prefs: chrome_options.add_experimental_option("prefs", prefs)
-            
-            # Özel Chrome seçenekleri
-            for option in self.config.chrome_options: chrome_options.add_argument(option)
-            
-            # Proxy ayarları
-            if self.config.proxy:  chrome_options.add_argument(f"--proxy-server={self.config.proxy}")
-            
-            # ChromeDriver servisini oluştur
-            if settings.chromedriver_path and os.path.exists(settings.chromedriver_path): service = Service(executable_path=settings.chromedriver_path)
-            else: service = Service(ChromeDriverManager().install())
-            
-            # Chrome binary path
-            if settings.chrome_binary_path and os.path.exists(settings.chrome_binary_path): chrome_options.binary_location = settings.chrome_binary_path
-            
-            # Async içinde browser başlat
-            loop = asyncio.get_event_loop()
-            self.driver = await loop.run_in_executor( None,  lambda: webdriver.Chrome(service=service, options=chrome_options) )
-            
-            # Bot detection bypass
-            await loop.run_in_executor(None, self._setup_stealth)
-            
-            # Başlangıçta API ana sayfasını aç
-            # API ana sayfasını açmayı ayrı bir task'e al
-            asyncio.create_task(self._delayed_api_load())
 
-            # Timeout ayarları
+            # UA
+            if self.config.user_agent:
+                chrome_options.add_argument(f"--user-agent={self.config.user_agent}")
+
+            # Ek kullanıcı tanımlı seçenekler
+            for option in self.config.chrome_options:
+                chrome_options.add_argument(option)
+
+            if self.config.proxy:
+                chrome_options.add_argument(f"--proxy-server={self.config.proxy}")
+
+            service = Service(executable_path=chromedriver_path)
+
+            if settings.chrome_binary_path and os.path.exists(settings.chrome_binary_path):
+                chrome_options.binary_location = settings.chrome_binary_path
+
+            loop = asyncio.get_event_loop()
+            self.driver = await loop.run_in_executor(
+                None,
+                lambda: webdriver.Chrome(service=service, options=chrome_options)
+            )
+            if not self.driver:
+                logger.error("Failed to initialize the browser driver.")
+                return False
+
+            await loop.run_in_executor(None, self._setup_stealth)
+
             self.driver.set_page_load_timeout(settings.browser_timeout)
             self.driver.implicitly_wait(10)
-            
+
             self.is_initialized = True
             self.session_count += 1
             logger.info("Browser initialized successfully")
             return True
-            
         except Exception as e:
             logger.error(f"Browser initialization failed: {e}")
             self.is_initialized = False
             return False
     
+    
+    
+    
+    
+    
     async def _delayed_api_load(self):
         """API hazır olduktan sonra ana sayfayı aç"""
+        if self.driver is None or not self.is_initialized:
+            logger.error("Browser is not initialized.")
+            return
         api_url = f"http://{settings.host}:{settings.port}"
         max_attempts = 30
         
@@ -153,15 +181,14 @@ class BrowserManager:
     
     def _setup_stealth(self):
         """Bot detection bypass"""
-        try:            
+        if not self.driver:
+            logger.error("Browser is not initialized.")
+            return
+        try:
             # WebDriver property'sini gizle
             self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            
             # Chrome Detection bypass
-            self.driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-                "userAgent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            })
-            
+            self.driver.execute_cdp_cmd('Network.setUserAgentOverride', { "userAgent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' })
             # Permissions override
             self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
                 "source": """
@@ -172,19 +199,26 @@ class BrowserManager:
                     });
                 """
             })
-            
-        except Exception as e:
-            logger.warning(f"Stealth setup failed: {e}")
+        except Exception as e: logger.warning(f"Stealth setup failed: {e}")
+    
+    
+    
+    
+    
+    
     
     async def navigate_to_url(self, url: str, timeout: Optional[int] = None) -> bool:
         """URL'ye git"""
+        if not self.is_initialized or not self.driver:
+            logger.error("Browser is not initialized.")
+            return False
         try:
             if not self.is_initialized: await self.initialize_browser()
             timeout = timeout or settings.browser_timeout
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self.driver.get, url)
             # Sayfa yüklenene kadar bekle
-            await loop.run_in_executor(  None, lambda: WebDriverWait(self.driver, timeout).until(lambda d: d.execute_script("return document.readyState") == "complete" ) )
+            await loop.run_in_executor(None, lambda: WebDriverWait(self.driver, timeout).until(lambda d: d.execute_script("return document.readyState") == "complete")) # type: ignore
             logger.info(f"Successfully navigated to: {url}")
             return True
         except TimeoutException:
@@ -194,8 +228,19 @@ class BrowserManager:
             logger.error(f"Navigation failed for URL {url}: {e}")
             return False
     
+    
+    
+    
+    
+    
+    
+    
+    
     async def wait_for_element(self, selector: str, timeout: int = 30, by: str = "css") -> bool:
         """Element yüklenene kadar bekle"""
+        if not self.is_initialized or not self.driver:
+            logger.error("Browser is not initialized.")
+            return False
         try:
             loop = asyncio.get_event_loop()
             wait = WebDriverWait(self.driver, timeout)
@@ -207,7 +252,7 @@ class BrowserManager:
                 "name": By.NAME,
                 "tag": By.TAG_NAME,
                 "class": By.CLASS_NAME
-            }
+                }
             
             by_method = by_mapping.get(by, By.CSS_SELECTOR)
             
@@ -225,6 +270,11 @@ class BrowserManager:
             logger.error(f"Element wait failed: {e}")
             return False
 
+
+
+
+
+
     async def click_element(self, element: WebElement) -> bool:
         """Element'e tıkla"""
         try:
@@ -239,6 +289,9 @@ class BrowserManager:
     
     async def scroll_page(self, direction: str = "down", count: int = 1) -> bool:
         """Sayfa scroll"""
+        if not self.is_initialized or not self.driver:
+            logger.error("Browser is not initialized.")
+            return False
         try:
             loop = asyncio.get_event_loop()
             for _ in range(count):
@@ -251,8 +304,19 @@ class BrowserManager:
             logger.error(f"Scrolling failed: {e}")
             return False
     
+    
+    
+    
+    
+    
+    
+    
+    
     async def take_screenshot(self, file_path: str, full_page: bool = False) -> bool:
         """Screenshot al"""
+        if not self.is_initialized or not self.driver:
+            logger.error("Browser is not initialized.")
+            return False
         try:
             loop = asyncio.get_event_loop()
             Path(file_path).parent.mkdir(parents=True, exist_ok=True)
@@ -267,14 +331,22 @@ class BrowserManager:
             logger.error(f"Screenshot failed: {e}")
             return False
     
+    
+    
+    
+    
+    
     async def get_browser_info(self) -> Dict[str, Any]:
         """Tarayıcı bilgilerini al"""
+        if not self.driver:
+            logger.error("Browser is not initialized.")
+            return {"error": "Browser is not initialized."}
         try:
             loop = asyncio.get_event_loop()
             return {
-                "current_url": await loop.run_in_executor(None, lambda: self.driver.current_url),
-                "title": await loop.run_in_executor(None, lambda: self.driver.title),
-                "window_size": await loop.run_in_executor(None, lambda: self.driver.get_window_size()),
+                "current_url": await loop.run_in_executor(None, lambda: self.driver.current_url),           # type: ignore
+                "title": await loop.run_in_executor(None, lambda: self.driver.title),                       # type: ignore
+                "window_size": await loop.run_in_executor(None, lambda: self.driver.get_window_size()),     # type: ignore
                 "session_id": self.driver.session_id,
                 "capabilities": self.driver.capabilities,
                 "uptime": time.time() - self.start_time,
@@ -283,6 +355,10 @@ class BrowserManager:
         except Exception as e:
             logger.error(f"Failed to get browser info: {e}")
             return {}
+    
+    
+    
+    
     
     async def restart_browser(self) -> bool:
         """Tarayıcıyı yeniden başlat"""
@@ -294,18 +370,25 @@ class BrowserManager:
             return False
     
     async def close_browser(self):
-        """Tarayıcıyı kapat"""
-        drv = getattr(self, "driver", None)
-        if drv:
+        if self.driver:
             try:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, drv.quit)
-            except Exception as e: logger.error(f"Error closing browser: {e}")
+                self.driver.quit()
+                logger.info("Browser closed successfully.")
+            except Exception as e:
+                logger.error(f"Error closing browser: {e}")
             finally:
-                self.driver = None  # type: ignore
+                self.driver = None
                 self.is_initialized = False
-                logger.info("Browser closed")
 
 
-# Global browser manager instance
-browser_manager = BrowserManager()
+
+# Global browser_manager referansı
+browser_manager: Optional[BrowserManager] = None
+
+def get_browser_manager() -> BrowserManager:
+    """BrowserManager nesnesini döner, yoksa oluşturur."""
+    global browser_manager
+    if browser_manager is None:
+        browser_manager = BrowserManager()
+    return browser_manager
+

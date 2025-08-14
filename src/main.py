@@ -1,166 +1,229 @@
-import os, asyncio, time
-from src.settings import settings
-from src.scrap_page import scrap_all_pages
-from src.browser_manager import browser_manager
-from time import sleep
-from typing import List
+import os, asyncio, time, hashlib
 from datetime import datetime
+from typing import List, Set
 
 from bs4 import BeautifulSoup
-try: from selenium.webdriver.common.by import By
-except ImportError: By = None
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import (
+    WebDriverException,
+    NoSuchElementException,
+    StaleElementReferenceException,
+)
 
+from src.settings import settings
+from src.browser_manager import get_browser_manager, BrowserManager
 
-_clicked_cards = set()
-_processed_details = set()
-
+# ================== KONSTLAR ==================
+TARGET_URL = "https://partner.tgoyemek.com/meal/245018/order/list"
 DETAILS_KEYWORD = "order/list/details"
 CARD_SELECTOR = ".order-card"
 
 DESKTOP_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
+SAVE_DIR = os.path.join(DESKTOP_DIR, "saveAl")
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-def _save_page_snapshot(driver, prefix: str = "sayfa") -> str:
-    """Aktif pencerenin <html> içeriğini Desktop'a kaydeder ve yolunu döner."""
+# ================== DURUM =====================
+browser_manager: BrowserManager = get_browser_manager()
+_clicked_cards: Set[str] = set()
+_processed_detail_urls: Set[str] = set()
+_processed_handles: Set[str] = set()
+_base_handle: str | None = None
+
+# ================== YARDIMCI ==================
+def _hash(txt: str) -> str:
+    return hashlib.sha256(txt.encode("utf-8", "ignore")).hexdigest()[:16]
+
+def _capture_dom_outer_html(driver) -> str:
     try:
-        html_source = driver.execute_script("return document.documentElement.outerHTML;")
-    except Exception:
-        html_source = getattr(driver, "page_source", "") or ""
+        driver.execute_cdp_cmd("DOM.enable", {})
+        root = driver.execute_cdp_cmd("DOM.getDocument", {"depth": 0})
+        node_id = root["root"]["nodeId"]
+        return driver.execute_cdp_cmd("DOM.getOuterHTML", {"nodeId": node_id}).get("outerHTML", "")
+    except Exception: return driver.page_source or ""
+
+def _save_html_snapshot(driver, prefix: str) -> str:
+    html_source = _capture_dom_outer_html(driver)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"{prefix}_{ts}.txt"
-    os.makedirs(os.path.join(DESKTOP_DIR,"saveAl"), exist_ok=True)
-    path = os.path.join(DESKTOP_DIR,"saveAl", filename)
+    page_title = (driver.title or "page").replace(" ", "_").replace("/", "_").replace("\\", "_")
+    path = os.path.join(SAVE_DIR, f"{ts}_{prefix}_{page_title}.html")
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(html_source)
-    except Exception as e:
-        print(f"Snapshot kaydedilemedi: {e}")
-        return ""
-    print(f"💾 Sayfa kaydedildi: {path}")
+        with open(path, "w", encoding="utf-8") as f: f.write(html_source)
+        print(f"💾 Kaydedildi: {path}")
+    except Exception as e: print(f"Snapshot kaydedilemedi: {e}")
     return path
 
-def _any_details_tab(driver) -> bool:
-    for h in driver.window_handles:
-        driver.switch_to.window(h)
-        if DETAILS_KEYWORD in (driver.current_url or ""):
-            return True
-    return False
-
-def _click_order_cards(driver) -> int:
-    if By is None:  return 0
-    try:  cards = driver.find_elements(By.CSS_SELECTOR, CARD_SELECTOR)
-    except Exception:  return 0
-    count = 0
+def _click_new_order_cards(driver) -> int:
+    try:
+        cards = driver.find_elements(By.CSS_SELECTOR, CARD_SELECTOR)
+    except Exception:
+        return 0
+    clicked = 0
     for el in cards:
         try:
-            key = f"{driver.current_url}@@{el.text.strip()[:120]}"
-            if key in _clicked_cards: continue
+            txt = el.text.strip()
+            if not txt:  continue
+            key = _hash(f"{driver.current_url}|{txt}")
+            if key in _clicked_cards:  continue
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
             el.click()
             _clicked_cards.add(key)
-            count += 1
-            time.sleep(0.3)
-        except Exception: continue
-    return count
+            clicked += 1
+            time.sleep(0.25)
+        except (StaleElementReferenceException, NoSuchElementException):
+            continue
+        except Exception:
+            continue
+    return clicked
 
-def _extract_details(driver) -> List[str]:
-    new_contents = []
-    current_tab = driver.current_window_handle
-    for h in driver.window_handles:
-        driver.switch_to.window(h)
-        try: _save_page_snapshot(driver, prefix="sayfa")
-        except : pass
-        url = driver.current_url or ""
-        if DETAILS_KEYWORD not in url: continue
-        if url in _processed_details: continue
-        html = driver.page_source or ""
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "noscript", "template"]):  tag.decompose()
-        text = "\n".join([ln.strip() for ln in soup.get_text("\n").splitlines() if ln.strip()])
-        print(f"\n===== DETAY SAYFASI =====\nURL: {url}\nKarakter: {len(text)}:\n{text}\n==========================\n")
-        _processed_details.add(url)
-        new_contents.append(text)
-    try: driver.switch_to.window(current_tab)
-    except: pass
-    return new_contents
+def _process_detail_tab_content(driver) -> bool:
+    url = driver.current_url or ""
+    if DETAILS_KEYWORD not in url:
+        return False
+    if url in _processed_detail_urls:
+        return False
+    html = driver.page_source or ""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "template"]):
+        tag.decompose()
+    text = "\n".join([ln.strip() for ln in soup.get_text("\n").splitlines() if ln.strip()])
+    print(f"\n===== DETAY =====\nURL: {url}\nKarakter: {len(text)}\n{text[:500]}{'...' if len(text)>500 else ''}\n=================\n")
+    _processed_detail_urls.add(url)
+    _save_html_snapshot(driver, prefix="detail")
+    return True
 
-def islemler():
-    driver = getattr(browser_manager, "driver", None)
-    if not driver: return "Driver yok"
-    made_clicks = 0
-    if not _any_details_tab(driver):
-        for h in list(driver.window_handles):
-            try:
-                driver.switch_to.window(h) 
-                made_clicks += _click_order_cards(driver)
-            except Exception: continue
-        if made_clicks: return f"{made_clicks} order-card tıklandı."
-    new_details = _extract_details(driver)
-    if new_details: return f"{len(new_details)} yeni details işlendi. Toplam: {len(_processed_details)}"
-    return None
+def _process_new_detail_tabs(driver) -> int:
+    """
+    Yeni açılmış (base harici) sekmelere minimal geçiş.
+    İşlenen sekme kapatılır, base sekmeye geri dönülür.
+    """
+    global _base_handle
+    if _base_handle is None:
+        _base_handle = driver.current_window_handle
 
+    processed_count = 0
+    handles = list(driver.window_handles)
 
-async def async_main():
-    try:
-        print("🎨 ScrapyBridge  başlatılıyor...")
-        
-        # Browser'ı başlat
-        print("🌐 Browser başlatılıyor...")
-        if await browser_manager.initialize_browser(): print("✅ Browser başarıyla başlatıldı!")
-        else:
-            print("❌ Browser başlatılamadı!")
-            return 
+    # Sadece yeni (işlenmemiş) ve base olmayan sekmeler
+    new_handles = [h for h in handles if h != _base_handle and h not in _processed_handles]
 
-        # Google.com'a git
-        print("🔍 Google.com'a yönlendiriliyor...")
-        if await browser_manager.navigate_to_url("https://google.com"): print("✅ Google.com başarıyla yüklendi!")
-        else: 
-            print("❌ Google.com yüklenemedi!")
-            return 
-        
-        # Browser bilgilerini göster
-        browser_info = await browser_manager.get_browser_info()
-        print(f"📊 Aktif URL: {browser_info.get('current_url')}")
-        print(f"📊 Sayfa Başlığı: {browser_info.get('title')}")
-        
-
-        # https://partner.tgoyemek.com/meal/245018/order/list sayfasına git
-        print("🔍 Yemek siparişi sayfasına yönlendiriliyor...")
-        if await browser_manager.navigate_to_url("https://partner.tgoyemek.com/meal/245018/order/list"): print("✅ Yemek siparişi sayfası başarıyla yüklendi!")
-        else:
-            print("❌ Yemek siparişi sayfası yüklenemedi!")
-            return
-
-        while True:
-            try:
-                status = islemler()
-                if status: print(status)
-                sleep(2)
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                print(f"İşlem hatası: {e}")
-
-        # Browser'ı açık tut (kullanıcı kapatana kadar)
-        print("🔄 Browser açık kalacak. Kapatmak için Ctrl+C basın...")
+    for h in new_handles:
         try:
-            while True:   await asyncio.sleep(1)
-        except KeyboardInterrupt:  print("\n👋 Çıkış yapılıyor...")
-            
-    except KeyboardInterrupt:
-        print("\n👋 Kullanıcı tarafından durduruldu...")
-    except Exception as e:
-        print(f"Hata (main.py): {e}")
-    finally:
-        # Browser'ı kapat
-        print("🔚 Browser kapatılıyor...")
-        await browser_manager.close_browser()
-        print("✅ Temizlik tamamlandı!")
+            driver.switch_to.window(h)
+            if _process_detail_tab_content(driver):
+                processed_count += 1
+            _processed_handles.add(h)
+            # Sekmeyi kapat (detaylar alındıktan sonra)
+            driver.close()
+            driver.switch_to.window(_base_handle)
+        except Exception:
+            # Sekme kapanmış olabilir; devam et
+            try:
+                if _base_handle in driver.window_handles:
+                    driver.switch_to.window(_base_handle)
+            except Exception:
+                pass
+            continue
 
+    # Eğer detay aynı sekmede (base) açıldıysa:
+    try:
+        if driver.current_window_handle == _base_handle and DETAILS_KEYWORD in (driver.current_url or ""):
+            if _process_detail_tab_content(driver):
+                processed_count += 1
+                # Liste sayfasına geri dön (gerekiyorsa)
+                driver.back()
+                time.sleep(0.7)
+    except Exception:
+        pass
+
+    return processed_count
+
+def _loop_step(driver) -> str | None:
+    """
+    Tek döngü adımı: yeni kartlara tıkla, yeni detay sekmelerini işle.
+    Minimal sekme geçişi.
+    """
+    global _base_handle
+    if not driver:
+        return "Driver yok"
+    if _base_handle is None:
+        _base_handle = driver.current_window_handle
+
+    current_url = driver.current_url or ""
+
+    clicks = 0
+    if DETAILS_KEYWORD not in current_url:
+        # Yalnızca liste sayfasındayken kartlara tıkla
+        clicks = _click_new_order_cards(driver)
+
+    processed = _process_new_detail_tabs(driver)
+
+    msg_parts = []
+    if clicks:
+        msg_parts.append(f"{clicks} kart tıklandı")
+    if processed:
+        msg_parts.append(f"{processed} detay işlendi (Toplam: {len(_processed_detail_urls)})")
+
+    # Periyodik liste snapshot (örn. her 30 sn)
+    if int(time.time()) % 30 == 0 and DETAILS_KEYWORD not in current_url:
+        _save_html_snapshot(driver, prefix="list")
+
+    return " | ".join(msg_parts) if msg_parts else None
+
+# ================== ASYNC ANA ==================
+async def async_main():
+    global _base_handle
+    print("🎨 ScrapyBridge başlatılıyor...")
+    print("🌐 Browser başlatılıyor...")
+    if not await browser_manager.initialize_browser():
+        print("❌ Browser başlatılamadı!")
+        return
+    print("✅ Browser başarıyla başlatıldı!")
+
+    print(f"🔍 {TARGET_URL} sayfasına yönlendiriliyor...")
+    if not await browser_manager.navigate_to_url(TARGET_URL):
+        print(f"❌ {TARGET_URL} yüklenemedi!")
+        return
+    print("✅ Sayfa yüklendi!")
+
+    _base_handle = getattr(browser_manager.driver, "current_window_handle", None)
+    print("\n🔄 Döngü başlıyor. Çıkmak için Ctrl+C ...")
+
+    driver = browser_manager.driver
+    while True:
+        try:
+            status = _loop_step(driver)
+            if status:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {status}")
+            await asyncio.sleep(4)
+        except KeyboardInterrupt:
+            print("\n🛑 Kullanıcı durdurdu.")
+            break
+        except WebDriverException as e:
+            print(f"💥 WebDriverException: {e}")
+            print("🔄 Yeniden başlatılıyor...")
+            await browser_manager.close_browser()
+            await asyncio.sleep(2)
+            if await browser_manager.initialize_browser() and await browser_manager.navigate_to_url(TARGET_URL):
+                if not browser_manager.driver:
+                    print("❌ Yeniden başlatma başarısız.")
+                    break
+                print("✅ Yeniden başlatıldı.")
+                _base_handle = browser_manager.driver.current_window_handle
+            else:
+                print("❌ Yeniden başlatma başarısız.")
+                break
+        except Exception as e:
+            print(f"Genel hata: {e}")
+            await asyncio.sleep(5)
+
+    print("\n🔚 Browser kapatılıyor...")
+    await browser_manager.close_browser()
+    print("✅ Temizlik tamamlandı!")
 
 def main():
     asyncio.run(async_main())
 
-if __name__ == "__main__": 
+if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)).replace("src", ""))
-    print("Çalışma dizini:", os.getcwd(),"\n\n\n")
+    print("Çalışma dizini:", os.getcwd(), "\n")
     main()

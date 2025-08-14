@@ -1,4 +1,4 @@
-r"""
+"""
 scrap paket başlangıcı.
 BrowserManager tekil (singleton) erişimi sağlar.
 """
