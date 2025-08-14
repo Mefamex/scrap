@@ -16,7 +16,7 @@ from src.browser_manager import get_browser_manager, BrowserManager
 # ================== KONSTLAR ==================
 TARGET_URL = "https://partner.tgoyemek.com/meal/245018/order/list"
 DETAILS_KEYWORD = "order/list/details"
-CARD_SELECTOR = ".order-card"
+CARD_SELECTOR = ".order-card" # tüm hepsine tıklanıp bilgileri alınacak
 
 DESKTOP_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
 SAVE_DIR = os.path.join(DESKTOP_DIR, "saveAl")
@@ -53,10 +53,8 @@ def _save_html_snapshot(driver, prefix: str) -> str:
     return path
 
 def _click_new_order_cards(driver) -> int:
-    try:
-        cards = driver.find_elements(By.CSS_SELECTOR, CARD_SELECTOR)
-    except Exception:
-        return 0
+    try: cards = driver.find_elements(By.CSS_SELECTOR, CARD_SELECTOR)
+    except Exception: return 0
     clicked = 0
     for el in cards:
         try:
@@ -69,22 +67,18 @@ def _click_new_order_cards(driver) -> int:
             _clicked_cards.add(key)
             clicked += 1
             time.sleep(0.25)
-        except (StaleElementReferenceException, NoSuchElementException):
-            continue
-        except Exception:
-            continue
+            # kartların bilgileri alıcak ve ekrana yazdırılacak
+        except (StaleElementReferenceException, NoSuchElementException):  continue
+        except Exception: continue
     return clicked
 
 def _process_detail_tab_content(driver) -> bool:
     url = driver.current_url or ""
-    if DETAILS_KEYWORD not in url:
-        return False
-    if url in _processed_detail_urls:
-        return False
+    if DETAILS_KEYWORD not in url: return False
+    if url in _processed_detail_urls: return False
     html = driver.page_source or ""
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "template"]):
-        tag.decompose()
+    for tag in soup(["script", "style", "noscript", "template"]): tag.decompose()
     text = "\n".join([ln.strip() for ln in soup.get_text("\n").splitlines() if ln.strip()])
     print(f"\n===== DETAY =====\nURL: {url}\nKarakter: {len(text)}\n{text[:500]}{'...' if len(text)>500 else ''}\n=================\n")
     _processed_detail_urls.add(url)
@@ -97,8 +91,7 @@ def _process_new_detail_tabs(driver) -> int:
     İşlenen sekme kapatılır, base sekmeye geri dönülür.
     """
     global _base_handle
-    if _base_handle is None:
-        _base_handle = driver.current_window_handle
+    if _base_handle is None: _base_handle = driver.current_window_handle
 
     processed_count = 0
     handles = list(driver.window_handles)
@@ -109,11 +102,8 @@ def _process_new_detail_tabs(driver) -> int:
     for h in new_handles:
         try:
             driver.switch_to.window(h)
-            if _process_detail_tab_content(driver):
-                processed_count += 1
+            if _process_detail_tab_content(driver): processed_count += 1
             _processed_handles.add(h)
-            # Sekmeyi kapat (detaylar alındıktan sonra)
-            driver.close()
             driver.switch_to.window(_base_handle)
         except Exception:
             # Sekme kapanmış olabilir; devam et
@@ -151,21 +141,15 @@ def _loop_step(driver) -> str | None:
     current_url = driver.current_url or ""
 
     clicks = 0
-    if DETAILS_KEYWORD not in current_url:
-        # Yalnızca liste sayfasındayken kartlara tıkla
-        clicks = _click_new_order_cards(driver)
-
+    if DETAILS_KEYWORD not in current_url: clicks = _click_new_order_cards(driver)
     processed = _process_new_detail_tabs(driver)
 
     msg_parts = []
-    if clicks:
-        msg_parts.append(f"{clicks} kart tıklandı")
-    if processed:
-        msg_parts.append(f"{processed} detay işlendi (Toplam: {len(_processed_detail_urls)})")
+    if clicks:  msg_parts.append(f"{clicks} kart tıklandı")
+    if processed:  msg_parts.append(f"{processed} detay işlendi (Toplam: {len(_processed_detail_urls)})")
 
     # Periyodik liste snapshot (örn. her 30 sn)
-    if int(time.time()) % 30 == 0 and DETAILS_KEYWORD not in current_url:
-        _save_html_snapshot(driver, prefix="list")
+    if int(time.time()) % 30 == 0 and DETAILS_KEYWORD not in current_url: _save_html_snapshot(driver, prefix="list")
 
     return " | ".join(msg_parts) if msg_parts else None
 

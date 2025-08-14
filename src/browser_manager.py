@@ -79,7 +79,7 @@ class BrowserManager:
             os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
             
             chromedriver_path = _get_chrome_driver_path()
-            _terminate_chrome_tasks()
+            # _terminate_chrome_tasks()
 
             chrome_options = Options()
 
