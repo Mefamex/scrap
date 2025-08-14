@@ -77,12 +77,35 @@ def _save_html_snapshot(driver, prefix: str) -> str:
 def _parse_detail_panel_html(html: str) -> dict:
     """Detay panelindeki sipariş bilgisini ayrıştır ve dict döndür."""
     soup = BeautifulSoup(html, "html.parser")
-    result = {"items": [], "note": None, "totals": {}}
+    result = {"items": [], "note": None, "totals": {}, "customer_info": {}, "delivery_type": None, "payment_method": None}
 
     # Sipariş notu
     note_el = soup.select_one(".order-note__content")
-    if note_el: result["note"] = " ".join(note_el.get_text(" ", strip=True).split())
+    if note_el:
+        result["note"] = " ".join(note_el.get_text(" ", strip=True).split())
 
+    # Sipariş bilgileri (müşteri, adres, il/ilçe vb.)
+    for item in soup.select(".order-details-info__item"):
+        title_el = item.select_one(".order-details-info__item__title")
+        title = title_el.get_text(" ", strip=True).rstrip(":") if title_el else None
+        value = ""
+        spans = item.find_all("span")
+        if len(spans) >= 2:
+            value = " ".join(spans[1].get_text(" ", strip=True).split())
+        else:
+            # fallback: tamamını alıp başlıktan arındır
+            txt = item.get_text(" ", strip=True)
+            if title and txt.startswith(title):
+                value = txt[len(title):].strip()
+            else:
+                value = txt
+        if title: result["customer_info"][title] = value
+    # Teslimat tipi
+    del_el = soup.select_one(".order-details-info__delivery-type strong")
+    if del_el: result["delivery_type"] = del_el.get_text(" ", strip=True)
+    # Ödeme yöntemi
+    pay_el = soup.select_one(".order-payment-type span")
+    if pay_el: result["payment_method"] = pay_el.get_text(" ", strip=True)
     # Ürünler
     item_blocks = soup.select(".order-item-list .order-item")
     for blk in item_blocks:
@@ -95,6 +118,7 @@ def _parse_detail_panel_html(html: str) -> dict:
         # ignore empty product rows
         if not name and not price: continue
         result["items"].append({"name": name, "qty": qty, "price": price})
+
     # Totaller (ör: Sipariş Tutarı, Toplam vb.)
     for row in soup.select(".order-details-price tr"):
         tds = row.find_all("td")
@@ -198,28 +222,33 @@ def _click_new_order_cards(driver) -> int:
                     new_html = panel.get_attribute("outerHTML") or ""
                 except Exception:  new_html = ""
             print(f"🔎 Önceki panel uzunluğu: {len(prev_panel_html or '')}, yeni uzunluğu: {len(new_html or '')}")
-
             if new_html and len(new_html.strip()) > 50:
                 parsed = _parse_detail_panel_html(new_html)
                 # çıktı ver
                 print("\n===== DETAY (panel) =====")
                 title_preview = (txt[:120] + "...") if len(txt) > 120 else txt
                 print("Kart başlığı:", title_preview)
+                # Yeni: Sipariş bilgileri (müşteri / adres / sipariş no vb.)
+                if parsed.get("customer_info"):
+                    print("Sipariş Bilgileri:")
+                    for k, v in parsed["customer_info"].items():  print(f"  {k}: {v}")
+                if parsed.get("delivery_type"):
+                    print("Teslimat Tipi:", parsed["delivery_type"])
+                if parsed.get("payment_method"): print("Ödeme Yöntemi:", parsed["payment_method"])
+
                 if parsed.get("note"):  print("Sipariş Notu:", parsed["note"])
                 for it in parsed["items"]:  print(f"- {it['name']}  x{it['qty']}  {it['price']}")
                 if parsed["totals"]:
                     print("Toplamlar:")
-                    for k, v in parsed["totals"].items():  print(f"  {k}: {v}")
+                    for k, v in parsed["totals"].items(): print(f"  {k}: {v}")
                 print("=========================\n")
                 # kaydet
                 _save_html_snapshot(driver, prefix="detail")
                 _clicked_cards.add(key)
-                clicked += 1
-                prev_panel_html = new_html
+                prev_panel_html, clicked = new_html, clicked+1
             else:
                 print("⚠️ Detay paneli yüklenemedi veya anlamlı içerik yok.")
-                # kısa bekleme
-                time.sleep(0.4)
+                time.sleep(0.4)  # kısa bekleme
             time.sleep(0.35)
         except (StaleElementReferenceException, NoSuchElementException):  continue
         except Exception as e:
