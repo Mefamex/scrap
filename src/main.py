@@ -231,13 +231,11 @@ def _click_new_order_cards(driver) -> int:
 
 
 def _loop_step(driver) -> str | None:
-    """
-    Tek döngü adımı: yeni kartlara tıkla, detay panelini işle.
-    """
+    """  Tek döngü adımı: yeni kartlara tıkla, detay panelini işle. """
     if not driver: return "Driver yok"
     current_url = driver.current_url or ""
     clicks = 0
-    if DETAILS_KEYWORD not in current_url:  clicks = _click_new_order_cards(driver)
+    if DETAILS_KEYWORD in current_url:  clicks = _click_new_order_cards(driver)
     msg_parts = []
     if clicks: msg_parts.append(f"{clicks} kart işlendi (Toplam tıklanan: {len(_clicked_cards)})")
     # Periyodik liste snapshot (örn. her 30 sn)
@@ -269,8 +267,7 @@ async def async_main():
     while True:
         try:
             status = _loop_step(driver)
-            if status:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] {status}")
+            if status:  print(f"[{datetime.now().strftime('%H:%M:%S')}] {status}")
             await asyncio.sleep(4)
         except KeyboardInterrupt:
             print("\n🛑 Kullanıcı durdurdu.")
