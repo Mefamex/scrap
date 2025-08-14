@@ -23,6 +23,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from webdriver_manager.chrome import ChromeDriverManager
@@ -30,22 +31,13 @@ import asyncio, logging, time, os, base64, platform, subprocess, psutil
 from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 
-from src.settings import settings
+from src.settings import settings, _get_chrome_driver_path
 
 # Logger initialization
 logger = logging.getLogger(__name__)
 
 
-def get_default_user_data_dir() -> str:
-    """Chrome'un varsayılan kullanıcı veri dizinini otomatik olarak bulur."""
-    system = platform.system()
-    if system == "Windows":
-        local_app_data = os.getenv("LOCALAPPDATA", "")
-        if not local_app_data: raise RuntimeError("LOCALAPPDATA ortam değişkeni bulunamadı.")
-        return os.path.join(local_app_data, "Google", "Chrome", "User Data")
-    elif system == "Darwin": return os.path.expanduser("~/Library/Application Support/Google/Chrome")
-    elif system == "Linux": return os.path.expanduser("~/.config/google-chrome")
-    else:  raise RuntimeError(f"Desteklenmeyen işletim sistemi: {system}")
+
 def _terminate_chrome_tasks():
     """Sistemden açık Chrome görevlerini sonlandırır."""
     try:
@@ -69,7 +61,7 @@ class BrowserManager:
     def __init__(self):
         """Tarayıcı yöneticisi sınıfı"""
         if self._initialized: return
-        self.driver: Optional[webdriver.Chrome] = None
+        self.driver: Optional[WebDriver] = None
         self.is_initialized = False
         self.config = settings.browser_config
         self.start_time = time.time()
@@ -82,7 +74,11 @@ class BrowserManager:
             logger.info("Browser already initialized.")
             return True
         try:
-            chromedriver_path = settings._get_chrome_driver_path()
+            # --- 1) Çevre değişkenleri ile native log seviyesini düşür ---
+            os.environ.setdefault("ABSL_CPP_MIN_LOG_LEVEL", "3")
+            os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+            
+            chromedriver_path = _get_chrome_driver_path()
             _terminate_chrome_tasks()
 
             chrome_options = Options()
@@ -93,7 +89,10 @@ class BrowserManager:
             chrome_options.add_argument(f"--user-data-dir={user_data_dir}")
             chrome_options.add_argument("--profile-directory=Default")
             chrome_options.add_argument("--start-maximized")
-
+            # Log seviyesini düşür
+            chrome_options.add_argument("--log-level=3")
+            # Sesli girişi devre dışı bırak
+            chrome_options.add_argument("--disable-voice-input")
             # Temel güvenilir / performans flag'leri
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
@@ -108,30 +107,73 @@ class BrowserManager:
             chrome_options.add_argument("--disable-blink-features=AutomationControlled")
 
             # UA
-            if self.config.user_agent:
-                chrome_options.add_argument(f"--user-agent={self.config.user_agent}")
+            if self.config.user_agent: chrome_options.add_argument(f"--user-agent={self.config.user_agent}")
 
             # Ek kullanıcı tanımlı seçenekler
-            for option in self.config.chrome_options:
-                chrome_options.add_argument(option)
+            for option in self.config.chrome_options: chrome_options.add_argument(option)
 
-            if self.config.proxy:
-                chrome_options.add_argument(f"--proxy-server={self.config.proxy}")
+            if self.config.proxy: chrome_options.add_argument(f"--proxy-server={self.config.proxy}")
 
-            service = Service(executable_path=chromedriver_path)
+            # --- Manuel chromedriver başlat: stdout/stderr'i DEVNULL yaparak Chrome'un absl/TF loglarını bastır ---
+            # Uygulama Windows olduğundan CREATE_NO_WINDOW kullan (gerekiyorsa)
+            try:
+                # boş bir port isteği için socket kullanarak kullanılabilir port elde et
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(('127.0.0.1', 0))
+                port = s.getsockname()[1]
+                s.close()
+            except Exception: port = 0
 
-            if settings.chrome_binary_path and os.path.exists(settings.chrome_binary_path):
-                chrome_options.binary_location = settings.chrome_binary_path
+            chromedriver_cmd = [str(chromedriver_path), f"--port={port}"] if port else [str(chromedriver_path)]
+            creationflags = 0
+            if platform.system().lower() == "windows":
+                creationflags = subprocess.CREATE_NO_WINDOW
 
+            # Başlat ve çıktıyı sustur
+            self._chromedriver_proc = subprocess.Popen( chromedriver_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags, )
+
+            # Wait for chromedriver to accept connections (kısa bekleme döngüsü)
+            import time, socket
+            start = time.time()
+            timeout = 5.0
+            connected = False
+            port_to_try = port if port else 9515
+            while time.time() - start < timeout:
+                try:
+                    with socket.create_connection(("127.0.0.1", port_to_try), timeout=0.5):
+                        connected = True
+                        break
+                except Exception:
+                    time.sleep(0.1)
+                    continue
+
+            if not connected:
+                # chromedriver açılamadıysa proc'u öldür ve hata ver
+                try:
+                    if self._chromedriver_proc:
+                        self._chromedriver_proc.kill()
+                        self._chromedriver_proc = None
+                except Exception:  pass
+                raise RuntimeError("Chromedriver process başlatılamadı veya bağlantı kurulamadı.")
+
+            # ChromeOptions ile remote driver'a bağlan
+            from selenium.webdriver.remote.webdriver import WebDriver
+            from selenium.webdriver.remote.remote_connection import RemoteConnection
+
+            executor_url = f"http://127.0.0.1:{port_to_try}"
             loop = asyncio.get_event_loop()
+            # webdriver.Remote kullanarak chromedriver'a bağlan
             self.driver = await loop.run_in_executor(
                 None,
-                lambda: webdriver.Chrome(service=service, options=chrome_options)
+                lambda: webdriver.Remote(command_executor=executor_url, options=chrome_options)
             )
+
             if not self.driver:
                 logger.error("Failed to initialize the browser driver.")
                 return False
-
+            
+            
             await loop.run_in_executor(None, self._setup_stealth)
 
             self.driver.set_page_load_timeout(settings.browser_timeout)
@@ -145,8 +187,8 @@ class BrowserManager:
             logger.error(f"Browser initialization failed: {e}")
             self.is_initialized = False
             return False
-    
-    
+        # Eğer manuel başlattıysak chromedriver sürecini sonlandır
+
     
     
     
@@ -379,7 +421,13 @@ class BrowserManager:
             finally:
                 self.driver = None
                 self.is_initialized = False
-
+        try:
+            if getattr(self, "_chromedriver_proc", None):
+                proc = self._chromedriver_proc
+                if proc and proc.poll() is None: proc.kill()
+                self._chromedriver_proc = None
+        except Exception as e: logger.debug(f"Chromedriver proc kill error: {e}")
+        finally: self._chromedriver_proc = None
 
 
 # Global browser_manager referansı

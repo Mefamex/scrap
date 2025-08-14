@@ -78,29 +78,30 @@ class Settings(BaseSettings):
     cache_ttl: int = 300  # 5 dakika
     
     
-    @staticmethod
-    def _get_chrome_driver_path() -> str:
-        """ChromeDriver'ın yolunu kontrol et veya indir."""
-        chromedriver_path = Path(settings.chromedriver_path)
-        if chromedriver_path.exists():
-            print(f"Mevcut ChromeDriver bulundu: {chromedriver_path}")
-            return str(chromedriver_path)
-        else:
-            print("ChromeDriver bulunamadı, indiriliyor...")
-            try:
-                from webdriver_manager.chrome import ChromeDriverManager
-                driver_path = ChromeDriverManager(driver_version="137.0.7151.119").install()
-                print(f"ChromeDriver indirildi: {driver_path}")
-                
-                # ChromeDriver'ı proje ana dizinine taşı
-                target_path = Path(settings.chromedriver_path)
-                shutil.move(driver_path, target_path)
-                print(f"ChromeDriver taşındı: {target_path}")
-                return str(target_path)
-            except Exception as e:
-                print(f"ChromeDriver indirilemedi: {e}")
-                print("Program sonlandırılıyor...")
-                sys.exit(1)
+@staticmethod
+def _get_chrome_driver_path() -> str:
+    """ChromeDriver'ın yolunu kontrol et veya indir."""
+    chromedriver_path = Path(settings.chromedriver_path)
+    if chromedriver_path.exists():
+        # chrome Driver bu projenin dizininde mi ?
+        if chromedriver_path.parent == Path(settings.app_base_dir): print(f"✅ Kendimizin Chrome'u bulundu: {chromedriver_path}")
+        else: print(f"❌ Başka bir ChromeDriver bulundu: {chromedriver_path}")
+        return str(chromedriver_path)
+    else:
+        print("ChromeDriver bulunamadı, indiriliyor...")
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            driver_path = ChromeDriverManager(driver_version="137.0.7151.119").install()
+            print(f"✅ ChromeDriver indirildi: {driver_path}")
+            # ChromeDriver'ı proje ana dizinine taşı
+            target_path = Path(settings.chromedriver_path)
+            shutil.move(driver_path, target_path)
+            print(f"✅ ChromeDriver taşındı: {target_path}")
+            return str(target_path)
+        except Exception as e:
+            print(f"❌ ChromeDriver indirilemedi: {e}")
+            print("Program sonlandırılıyor...")
+            sys.exit(1)
 
 
 
@@ -175,10 +176,7 @@ settings = Settings()
 
 
 # Otomatik user-agent doldurma
-if settings.browser_config.user_agent in (None, "", "auto"): 
-    print("Otomatik User-Agent algılandı.")
-    settings.browser_config.user_agent = _detect_system_chrome_user_agent(settings.chrome_binary_path)
-    print("User-Agent belirlendi:", settings.browser_config.user_agent,"\n\n")
+if settings.browser_config.user_agent in (None, "", "auto"):  settings.browser_config.user_agent = _detect_system_chrome_user_agent(settings.chrome_binary_path)
 
 # İstersen log seviyesine göre bildir
 print("Aktif User-Agent:", settings.browser_config.user_agent)

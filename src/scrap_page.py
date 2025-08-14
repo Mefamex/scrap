@@ -12,7 +12,7 @@ def _get_or_create_driver():
     """
     Mevcut Selenium driver'ı döner.
     (sync fonksiyon içinde await edemeyeceğimiz için burada initialize etmiyoruz;
-     main zaten initialize_browser çağırıyor. Hazır değilse None döner.)
+    main zaten initialize_browser çağırıyor. Hazır değilse None döner.)
     """
     if not getattr(browser_manager, "is_initialized", False):
         logger.debug("Browser manager henüz initialize edilmemiş; requests fallback kullanılacak.")
