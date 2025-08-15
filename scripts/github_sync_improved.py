@@ -6,7 +6,7 @@ GitHub'dan projenizi yerel sisteminize senkronize eder.
 Sadece değisen dosyalari indirir, performansli ve guvenli calisir.
 """
 
-import os, sys, logging, hashlib, requests, time, tempfile, shutil
+import os, sys, logging, hashlib, requests, time, tempfile, shutil, json
 from urllib.parse import urlencode
 from datetime import datetime, timezone
 from pathlib import Path
@@ -213,66 +213,127 @@ class GitHubSyncManager:
     
     
     def download_file(self, file_info: Dict, local_path: str) -> bool:
-        """Dosyayi indir (stream) ve atomik olarak kaydet.
-        Metin/script uzantıları normalize edilir (utf-8, BOM kaldırma, LF newline).
-        Binary dosyalar ham olarak yazılır.
         """
+        Güvenli indirme:
+        - Binary stream ile yaz (chunked)
+        - Aynı dizinde tmp dosya oluştur (atomik os.replace için)
+        - fsync ile diske yazma (mümkünse)
+        - Metin uzantıları için (%TEXT_EXTS) küçük dosyalarda BOM ve newline normalize et
+        - .syncmeta.json kullanarak ETag sakla / If-None-Match gönder (304 atlanır)
+        - Hata/exception durumunda tmp temizlenir
+        """
+        TEXT_EXTS = {'.bat', '.cmd', '.sh', '.ps1', '.py', '.txt', '.md', '.json', '.yaml', '.yml', '.html', '.htm', '.css', '.js'}
+        MAX_TEXT_SIZE = 5 * 1024 * 1024  # 5 MB
+        tmp_pathi, meta_path = None, None
         try:
             local_path_p = Path(local_path)
             parent = local_path_p.parent
             if parent and not parent.exists(): parent.mkdir(parents=True, exist_ok=True)
-            download_url = file_info.get("download_url")
-            if download_url: response = self._make_request(download_url, stream=True)
-            else:
-                api_url = file_info.get("url") or file_info.get("html_url")
-                if not api_url:
-                    logger.error(f"Dosya için indirilebilecek URL yok: {file_info.get('path')}")
-                    self.stats['errors'] += 1
-                    return False
-                response = self._make_request(api_url, stream=True, extra_headers={'Accept': 'application/vnd.github.v3.raw'})
+            try: # meta dosyasi (aynı klasörde) - küçük local cache: { relative_path: { "etag": "...", "last_mod": "..." } }
+                meta_path = parent / ".syncmeta.json"
+                meta = {}
+                if meta_path.exists():
+                    try: meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    except Exception: meta = {}
+                key = str(local_path_p.name)
+            except Exception:
+                meta = {}
+                meta_path = None
+                key = str(local_path_p.name) # ETag varsa header'a ekle
+            extra_headers = {}
+            try: # prefer file_info etag, fallback to meta
+                etag = (file_info.get("etag") if isinstance(file_info, dict) else None) or (meta.get(key, {}).get("etag") if meta else None)
+                if etag:  extra_headers['If-None-Match'] = etag
+            except Exception: pass
+            download_url = None # Doğru URL seçimi
+            if isinstance(file_info, dict):
+                download_url = file_info.get("download_url")
+                if not download_url:
+                    api_url = file_info.get("url") or file_info.get("html_url")
+                    if api_url: # raw almak için accept header
+                        extra_headers.setdefault('Accept', 'application/vnd.github.v3.raw')
+                        download_url = api_url
+            else: download_url = str(file_info)  # file_info direkt URL de olabilir
+            if not download_url:
+                logger.error(f"Dosya için indirilebilecek URL yok: {file_info}")
+                self.stats['errors'] += 1
+                return False
+            # İstek (stream)
+            response = self._make_request(download_url, stream=True, extra_headers=extra_headers or None)
             if not response: return False
-            suffix = local_path_p.suffix  # Geçici dosyaya yaz (binary)
+            # Eğer 304 Not Modified geldiyse, atla (hiç değiştirme yapılmadı)
+            if response.status_code == 304:
+                logger.debug(f"304 Not Modified: {local_path}")
+                return False
+            suffix = local_path_p.suffix.lower()
+            # Tmp oluştur ve yaz
             with tempfile.NamedTemporaryFile(delete=False, dir=str(parent) if parent else None, suffix=suffix) as tmp:
                 tmp_path = Path(tmp.name)
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk: tmp.write(chunk)
-                tmp.flush()
-            try:
-                if suffix.lower() in {'.bat', '.cmd', '.sh', '.ps1', '.py', '.txt', '.md', '.json', '.yaml', '.yml', '.html', '.htm', '.css', '.js'}:
-                    b, decoded = tmp_path.read_bytes(), None
-                    for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'latin-1'): # Denenecek enkodlar; utf-8-sig BOM'u temizler
-                        try:
-                            s = b.decode(enc) # Eğer içeriğinde NUL karakteri varsa muhtemelen binary -> skip decode
-                            if '\x00' in s:
-                                decoded = None
-                                continue
-                            decoded = s.replace('\r\n', '\n').replace('\r', '\n') # normalize newlines -> LF
-                            break
-                        except Exception: decoded = None
-                    if decoded is not None:
-                        tmp_path.write_text(decoded, encoding='utf-8', newline='\n') # yaz UTF-8 (BOM yok)
-                    else: pass # decode edilemedi; bırak binary olarak
-                # Binary dosyalar için olduğu gibi devam
-            except Exception as e: logger.debug(f"encoding normalize hata: {e}")
-            # Atomik taşımayı dene
-            try:
-                if local_path_p.exists():  # Eğer hedef zaten varsa üzerine yaz
-                    try: local_path_p.unlink()
+                try:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk: tmp.write(chunk)
+                    tmp.flush()
+                    try: os.fsync(tmp.fileno())
                     except Exception: pass
-                shutil.move(str(tmp_path), str(local_path_p))
-            except Exception as e:
-                try: # fallback: copy then remove
-                    shutil.copy2(str(tmp_path), str(local_path_p))
-                    tmp_path.unlink(missing_ok=True)
-                except Exception as e2:
-                    logger.error(f"Dosya hedefe taşınamadı: {local_path} - {e2}")
-                    self.stats['errors'] += 1
-                    return False
-            # Unix'te script uzantılarını çalıştırılabilir yap
+                except Exception as e: raise # yazma hatası
+            # Metin dosyasıysa ve makul büyüklükteyse normalize et (BOM+newline)
             try:
-                if os.name != 'nt' and suffix.lower() in {'.sh', '.py'}:
-                    mode = os.stat(local_path_p).st_mode
-                    os.chmod(local_path_p, mode | 0o111)
+                if suffix in TEXT_EXTS:
+                    size = tmp_path.stat().st_size
+                    if size <= MAX_TEXT_SIZE:
+                        b = tmp_path.read_bytes()
+                        decoded = None
+                        for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'latin-1'):
+                            try:
+                                s = b.decode(enc)
+                                if '\x00' in s:
+                                    decoded = None
+                                    continue
+                                decoded = s.replace('\r\n', '\n').replace('\r', '\n')
+                                break
+                            except Exception: decoded = None
+                        if decoded is not None:
+                            tmp_path.write_text(decoded, encoding='utf-8', newline='\n')
+                            try:
+                                with open(tmp_path, 'rb') as ftmp: os.fsync(ftmp.fileno())
+                            except Exception: pass
+                    else: logger.debug(f"Normalize atlandi (büyük dosya): {tmp_path} ({size} bytes)")
+            except Exception as e:
+                logger.debug(f"Normalize adımında hata (devam ediyor): {e}")
+            try: # Atomik taşıma ve izin koruma
+                prev_mode = None 
+                if local_path_p.exists():
+                    try: prev_mode = local_path_p.stat().st_mode
+                    except Exception: prev_mode = None
+                os.replace(str(tmp_path), str(local_path_p))
+                tmp_path = None
+                if prev_mode is not None:
+                    try: os.chmod(local_path_p, prev_mode)
+                    except Exception: pass
+                else:
+                    if os.name != 'nt' and suffix in {'.sh', '.py'}:
+                        try:
+                            mode = os.stat(local_path_p).st_mode
+                            os.chmod(local_path_p, mode | 0o111)
+                        except Exception: pass
+            except Exception as e:
+                logger.error(f"Dosya hedefe taşınamadı: {local_path} - {e}")
+                self.stats['errors'] += 1
+                if tmp_path and tmp_path.exists():
+                    try: tmp_path.unlink()
+                    except Exception: pass
+                return False
+            # ETag kaydet (varsa)
+            try:
+                resp_etag = response.headers.get('ETag')
+                if resp_etag and meta_path:
+                    try:
+                        meta = meta or {}
+                        meta[key] = meta.get(key, {})
+                        meta[key]['etag'] = resp_etag
+                        meta[key]['last_mod'] = response.headers.get('Last-Modified') or ''
+                        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+                    except Exception: pass
             except Exception: pass
             logger.info(f"Indirildi: {os.path.relpath(str(local_path_p))}")
             self.stats['downloaded'] += 1
@@ -280,9 +341,12 @@ class GitHubSyncManager:
         except Exception as e:
             logger.error(f"Dosya indirilemedi {local_path}: {e}")
             self.stats['errors'] += 1
+            if tmp_path and tmp_path.exists():
+                try: tmp_path.unlink()
+                except Exception: pass
             return False
 
-    
+
     def needs_update(self, file_info: Dict, local_path: str) -> bool:
         """Dosyanin guncellenmesi gerekip gerekmediğini kontrol et"""
         try:
@@ -363,57 +427,96 @@ class GitHubSyncManager:
 
     def self_update(self) -> bool:
         """
-        Uzakta yeni bir sürüm varsa indirir ve yereldeki dosyanın üzerine atomik yazma yapar.
-        Text dosyaları normalize edilir (utf-8, BOM kaldırma, newline '\n') ve onlara göre karşılaştırma yapılır.
-        Eğer güncelleme yapılırsa process'i aynı argümanlarla yeniden başlatır (os.execv).
-        Döner: True => güncelleme yapıldı (ve execv sonrası bu dönüş olmaz), False => değişiklik yok veya hata.
+        Önce commit tarihine bakar; uzaktaki dosya yerelden yeni ise download_file ile indirip atomik replace yapar.
+        Tarih alınamazsa eskiden olduğu gibi indirip içerik karşılaştırması yapar.
         """
         try:
-            remote = self._get_remote_script_content()
-            if not remote:
-                logger.debug("Self-update: remote içerik alınamadı veya bulunamadı.")
-                return False
+            candidates = [f"scripts/{Path(__file__).name}", Path(__file__).name]
             local_path = Path(__file__).resolve()
             def normalize_bytes(b: bytes) -> bytes:
-                # Text dosyaları için decode denemeleri ve normalize -> utf-8 (BOM removed), newlines '\n'
                 if local_path.suffix.lower() in {'.bat','.cmd','.sh','.ps1','.py','.txt','.md','.json','.yaml','.yml','.html','.htm','.css','.js'}:
                     for enc in ('utf-8-sig','utf-8','utf-16','latin-1'):
-                        try: return b.decode(enc).replace('\r\n', '\n').replace('\r', '\n').encode('utf-8')
+                        try:
+                            s = b.decode(enc)
+                            s = s.replace('\r\n', '\n').replace('\r', '\n')
+                            return s.encode('utf-8')
                         except Exception: continue
                     return b
-                else: return b
-
-            # Normalize remote bytes for comparison/writing if applicable
-            try: normalized_remote = normalize_bytes(remote)
-            except Exception: normalized_remote = remote
-            # Read and normalize local if exists
+                return b
+            local_mtime = None
             try:
-                with open(local_path, "rb") as f:  local = f.read()
-            except Exception as e:
-                logger.warning(f"Self-update: local dosya okunamadi: {e}")
-                local = b""
-            try: normalized_local = normalize_bytes(local) if local else None
-            except Exception: normalized_local = local
-            # Compare normalized content hashes
-            remote_hash = hashlib.sha256(normalized_remote).hexdigest()
-            local_hash = hashlib.sha256(normalized_local).hexdigest() if normalized_local else None
-            if local_hash == remote_hash:
-                logger.debug("Self-update: zaten güncel (normalize edilmiş içerik aynı).")
-                return False
+                if local_path.exists(): local_mtime = datetime.fromtimestamp(local_path.stat().st_mtime, tz=timezone.utc)
+            except Exception: local_mtime = None
             parent = local_path.parent
-            with tempfile.NamedTemporaryFile(delete=False, dir=str(parent)) as tmp:
-                tmp.write(normalized_remote)
-                tmp_path = Path(tmp.name)
-            shutil.move(str(tmp_path), str(local_path))
-            logger.info("Self-update: script güncellendi. Şimdi yeniden başlatılıyor...")
-            try: logging.shutdown()
-            except Exception: pass
-            # Aynı Python yorumlayıcısını ve argümanları kullanarak değiştir
-            os.execv(sys.executable, [sys.executable, str(local_path)] + sys.argv[1:])
-            return True
+            for p in candidates:
+                try:
+                    try: # 1) Önce commit tarihine bak
+                        remote_date = self.get_file_last_commit_date(str(p))
+                        if remote_date:
+                            if remote_date.tzinfo is None: remote_date = remote_date.replace(tzinfo=timezone.utc)
+                            else: remote_date = remote_date.astimezone(timezone.utc)
+                            if local_mtime and remote_date <= local_mtime:
+                                logger.debug(f"Self-update: {p} için uzak tarih yerel ile aynı veya eski; atlanıyor.")
+                                return False
+                        else: logger.debug(f"Self-update: {p} için commit tarihi alınamadı; içeriği karşılaştıracağım.")
+                    except Exception as e:
+                        logger.debug(f"Self-update tarih kontrolü başarısız ({p}): {e}")
+                        remote_date = None
+                    temp_target = parent / (local_path.name + ".new")
+                    try:
+                        if temp_target.exists(): temp_target.unlink()
+                    except Exception: pass
+                    contents = self.get_repo_contents(str(p))
+                    if not isinstance(contents, dict): continue
+                    ok = self.download_file(contents, str(temp_target))
+                    if not ok or not temp_target.exists():
+                        try:
+                            if temp_target.exists(): temp_target.unlink()
+                        except Exception: pass
+                        continue
+                    do_replace = False
+                    if remote_date: do_replace = True
+                    else:
+                        new_b = normalize_bytes(temp_target.read_bytes())
+                        try: local_b = normalize_bytes(local_path.read_bytes()) if local_path.exists() else None
+                        except Exception: local_b = None
+                        if local_b is None or hashlib.sha256(local_b).hexdigest() != hashlib.sha256(new_b).hexdigest(): do_replace = True
+                        else:
+                            try: temp_target.unlink()
+                            except Exception: pass
+                            logger.debug("Self-update: zaten güncel (içerik aynı).")
+                            return False
+                    if do_replace:
+                        prev_mode = None
+                        if local_path.exists():
+                            try: prev_mode = local_path.stat().st_mode
+                            except Exception: prev_mode = None
+                        os.replace(str(temp_target), str(local_path))
+                        if prev_mode is not None:
+                            try: os.chmod(local_path, prev_mode)
+                            except Exception: pass
+                        else:
+                            if os.name != 'nt' and local_path.suffix in {'.sh', '.py'}:
+                                try:
+                                    mode = os.stat(local_path).st_mode
+                                    os.chmod(local_path, mode | 0o111)
+                                except Exception: pass
+                        logger.info("Self-update: script güncellendi. Şimdi yeniden başlatılıyor...")
+                        try: logging.shutdown()
+                        except Exception: pass
+                        os.execv(sys.executable, [sys.executable, str(local_path)] + sys.argv[1:])
+                        return True
+                except Exception as e:
+                    logger.debug(f"Self-update adımı atlandi ({p}): {e}")
+                    try:
+                        if 'temp_target' in locals() and temp_target.exists(): temp_target.unlink()
+                    except Exception: pass
+                    continue
+            return False
         except Exception as e:
             logger.error(f"Self-update hata: {e}")
-            self.stats['errors'] += 1
+            try: self.stats['errors'] += 1
+            except Exception: pass
             return False
 
 
