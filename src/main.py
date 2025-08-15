@@ -129,6 +129,54 @@ def _parse_detail_panel_html(html: str) -> dict:
     return result
 
 
+def _log_processed_order(parsed: dict, title_preview: str) -> None:
+    """Yeni işlendiğinde masaüstündeki 'açtığı siparişler.txt' dosyasına ekle ve konsola özet bas."""
+    # Prepare lines
+    lines: list[str] = []
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"[{ts}] {title_preview}")
+    # Customer info
+    if parsed.get("customer_info"):
+        lines.append("-- Müşteri Bilgileri --")
+        for k, v in parsed["customer_info"].items(): lines.append(f"{k}: {v}")
+    if parsed.get("delivery_type"): lines.append(f"Teslimat Tipi: {parsed.get('delivery_type')}")
+    if parsed.get("payment_method"): lines.append(f"Ödeme Yöntemi: {parsed.get('payment_method')}")
+    if parsed.get("note"): lines.append(f"Sipariş Notu: {parsed.get('note')}")
+    if parsed.get("items"):
+        lines.append("-- Ürünler --")
+        for it in parsed["items"]:
+            lines.append(f"- {it.get('name','')}  x{it.get('qty','')}  {it.get('price','')}")
+    if parsed.get("totals"):
+        lines.append("-- Toplamlar --")
+        for k, v in parsed["totals"].items():
+            lines.append(f"{k}: {v}")
+    lines.append("\n")
+
+    # Console summary
+    print("\n--- SIPARIS KAYDI ---")
+    for l in lines:
+        print(l)
+    print("--- SON ---\n")
+
+    # Append to SAVE_DIR/siparisler.txt with timestamp header and long separator
+    try:
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        path = os.path.join(SAVE_DIR, "siparisler.txt")
+        sep = "-" * 80
+        # Write timestamp header then details then separator
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {title_preview}\n")
+            for l in lines[1:]:
+                f.write(l + "\n")
+            f.write(sep + "\n\n")
+        print(f"📝 Kaydedildi: {path}")
+    except Exception as e:
+        print(f"Dosyaya yazılamadı: {e}")
+
+
+# ...existing code...
+
+
 
 
 
@@ -140,34 +188,33 @@ def _wait_for_detail_panel_change(driver, previous_html: str | None, timeout: fl
         # Beklemede daha güvenli kontrol: önce anlamlı içeriğin gelmesini, sonra değişimi kontrol et
         start = time.time()
         last_html = previous_html or ""
-        # Eğer panel içinde ürün listesi veya fiyat tablosu varsa onu hedefle
-        inner_selector = ".order-item-list, .order-details-price"
+        # Panel içeriğinin tamamını al -> müşteri bilgileri de panel dışında ayrı bir blok olabilir
         while time.time() - start < timeout:
             try:
                 # panel referansının stale olma ihtimaline karşı yeniden bul
                 panel = driver.find_element(By.CSS_SELECTOR, DETAIL_PANEL_SELECTOR)
-                inner = ""
-                try:
-                    inner_el = panel.find_element(By.CSS_SELECTOR, inner_selector)
-                    inner = inner_el.get_attribute("outerHTML") or ""
-                except Exception:  inner = panel.get_attribute("outerHTML") or ""
-                current_html = inner.strip()
-            except Exception: current_html = ""
+                # panelin tamamını al (içindeki order-details-info, order-item-list vb. dahil)
+                current_html = (panel.get_attribute("outerHTML") or "").strip()
+            except Exception:
+                current_html = ""
             # önce boş panelden anlamlı içeriğe geçiş
             if not last_html:
-                if len(current_html) > 50: return current_html
+                if len(current_html) > 50:
+                    return current_html
             else:
-                if current_html and current_html != last_html:  return current_html
+                if current_html and current_html != last_html:
+                    return current_html
             time.sleep(0.12)
     except TimeoutException: return None
     except Exception: return None
     return None
 
 
-
+onceki_print = ""
 
 def _click_new_order_cards(driver) -> int:
     """Her yeni kartı tıkla, detay paneli yüklenmesini bekle, veriyi ayrıştır."""
+    global onceki_print
     try: cards = driver.find_elements(By.CSS_SELECTOR, CARD_SELECTOR)
     except Exception: return 0
     if not cards:
@@ -180,7 +227,10 @@ def _click_new_order_cards(driver) -> int:
         panel = driver.find_element(By.CSS_SELECTOR, DETAIL_PANEL_SELECTOR)
         prev_panel_html = panel.get_attribute("outerHTML") or ""
     except Exception:  prev_panel_html = ""
-    print(f"🧭 Bulunan kart sayısı: {len(cards)}  (daha önce işlenen: {len(_clicked_cards)})")
+    yaz = f"🧭 Bulunan kart sayısı: {len(cards)}  (daha önce işlenen: {len(_clicked_cards)})"
+    if onceki_print != yaz:
+        print(yaz)
+        onceki_print = yaz
     # Her döngüde index ile yeniden locate et -> stale referans önlemi
     for idx in range(len(cards)):
         try:
@@ -223,7 +273,14 @@ def _click_new_order_cards(driver) -> int:
                 except Exception:  new_html = ""
             print(f"🔎 Önceki panel uzunluğu: {len(prev_panel_html or '')}, yeni uzunluğu: {len(new_html or '')}")
             if new_html and len(new_html.strip()) > 50:
-                parsed = _parse_detail_panel_html(new_html)
+                # Bazı sayfalarda müşteri bilgileri ayrı bir blokta (.order-details-info) olabilir.
+                try:
+                    info_el = driver.find_element(By.CSS_SELECTOR, ".order-details-info")
+                    info_html = info_el.get_attribute("outerHTML") or ""
+                except Exception:
+                    info_html = ""
+                combined_html = (info_html or "") + new_html
+                parsed = _parse_detail_panel_html(combined_html)
                 # çıktı ver
                 print("\n===== DETAY (panel) =====")
                 title_preview = (txt[:120] + "...") if len(txt) > 120 else txt
@@ -242,8 +299,13 @@ def _click_new_order_cards(driver) -> int:
                     print("Toplamlar:")
                     for k, v in parsed["totals"].items(): print(f"  {k}: {v}")
                 print("=========================\n")
-                # kaydet
+                # log to file and save snapshot
+                try:
+                    _log_processed_order(parsed, title_preview)
+                except Exception as e:
+                    print(f"Logging hata: {e}")
                 _save_html_snapshot(driver, prefix="detail")
+                # İşlendikten sonra hash anahtarı ile işaretle
                 _clicked_cards.add(key)
                 prev_panel_html, clicked = new_html, clicked+1
             else:

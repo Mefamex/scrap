@@ -84,7 +84,7 @@ def _get_chrome_driver_path() -> str:
     chromedriver_path = Path(settings.chromedriver_path)
     if chromedriver_path.exists():
         # chrome Driver bu projenin dizininde mi ?
-        if chromedriver_path.parent == Path(settings.app_base_dir): print(f"✅ Kendimizin Chrome'u bulundu: {chromedriver_path}")
+        if chromedriver_path.parent == Path(settings.app_base_dir) or chromedriver_path.parent == Path(settings.app_base_dir) / "src" : print(f"✅ Kendimizin Chrome'u bulundu: {chromedriver_path}")
         else: print(f"❌ Başka bir ChromeDriver bulundu: {chromedriver_path}")
         return str(chromedriver_path)
     else:
