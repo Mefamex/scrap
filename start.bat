@@ -1,3 +1,5 @@
+
+REM filepath: c:\Users\Mefamex\Desktop\scrap\start.bat
 @echo off
 chcp 65001 >nul 2>&1
 echo.
@@ -68,4 +70,3 @@ echo.
 echo.
 echo UYGULAMA SONLANDIRILDI
 pause
-

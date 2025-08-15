@@ -1,3 +1,5 @@
+
+REM filepath: c:\Users\Mefamex\Desktop\scrap\install.bat
 @echo off
 chcp 65001 >nul 2>&1
 echo.
@@ -17,8 +19,6 @@ echo ===============================================
 echo       SCRAPY BRIDGE - WEB SCRAPER
 echo ===============================================
 echo.
-
-
 
 
 
@@ -67,11 +67,6 @@ echo Kurulum tamamlandi.
 
 
 
-
-
-
-
-
 echo.
 echo.
 echo.
@@ -100,4 +95,3 @@ echo BU PENCEREYI KAPAT !!!
 echo.
 pause
 exit /b 0
-
