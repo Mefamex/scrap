@@ -213,7 +213,10 @@ class GitHubSyncManager:
     
     
     def download_file(self, file_info: Dict, local_path: str) -> bool:
-        """Dosyayi indir (raw olarak)"""
+        """Dosyayi indir (stream) ve atomik olarak kaydet.
+        Metin/script uzantıları normalize edilir (utf-8, BOM kaldırma, LF newline).
+        Binary dosyalar ham olarak yazılır.
+        """
         try:
             local_path_p = Path(local_path)
             parent = local_path_p.parent
@@ -228,19 +231,57 @@ class GitHubSyncManager:
                     return False
                 response = self._make_request(api_url, stream=True, extra_headers={'Accept': 'application/vnd.github.v3.raw'})
             if not response: return False
-            with tempfile.NamedTemporaryFile(delete=False, dir=str(parent) if parent else None) as tmp:
+            suffix = local_path_p.suffix  # Geçici dosyaya yaz (binary)
+            with tempfile.NamedTemporaryFile(delete=False, dir=str(parent) if parent else None, suffix=suffix) as tmp:
+                tmp_path = Path(tmp.name)
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk: tmp.write(chunk)
-                tmp_path = Path(tmp.name)
-            shutil.move(str(tmp_path), str(local_path_p))
+                tmp.flush()
+            try:
+                if suffix.lower() in {'.bat', '.cmd', '.sh', '.ps1', '.py', '.txt', '.md', '.json', '.yaml', '.yml', '.html', '.htm', '.css', '.js'}:
+                    b, decoded = tmp_path.read_bytes(), None
+                    for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'latin-1'): # Denenecek enkodlar; utf-8-sig BOM'u temizler
+                        try:
+                            s = b.decode(enc) # Eğer içeriğinde NUL karakteri varsa muhtemelen binary -> skip decode
+                            if '\x00' in s:
+                                decoded = None
+                                continue
+                            decoded = s.replace('\r\n', '\n').replace('\r', '\n') # normalize newlines -> LF
+                            break
+                        except Exception: decoded = None
+                    if decoded is not None:
+                        tmp_path.write_text(decoded, encoding='utf-8', newline='\n') # yaz UTF-8 (BOM yok)
+                    else: pass # decode edilemedi; bırak binary olarak
+                # Binary dosyalar için olduğu gibi devam
+            except Exception as e: logger.debug(f"encoding normalize hata: {e}")
+            # Atomik taşımayı dene
+            try:
+                if local_path_p.exists():  # Eğer hedef zaten varsa üzerine yaz
+                    try: local_path_p.unlink()
+                    except Exception: pass
+                shutil.move(str(tmp_path), str(local_path_p))
+            except Exception as e:
+                try: # fallback: copy then remove
+                    shutil.copy2(str(tmp_path), str(local_path_p))
+                    tmp_path.unlink(missing_ok=True)
+                except Exception as e2:
+                    logger.error(f"Dosya hedefe taşınamadı: {local_path} - {e2}")
+                    self.stats['errors'] += 1
+                    return False
+            # Unix'te script uzantılarını çalıştırılabilir yap
+            try:
+                if os.name != 'nt' and suffix.lower() in {'.sh', '.py'}:
+                    mode = os.stat(local_path_p).st_mode
+                    os.chmod(local_path_p, mode | 0o111)
+            except Exception: pass
             logger.info(f"Indirildi: {os.path.relpath(str(local_path_p))}")
             self.stats['downloaded'] += 1
             return True
         except Exception as e:
-            logger.error(f"✗ Dosya indirilemedi {local_path}: {e}")
+            logger.error(f"Dosya indirilemedi {local_path}: {e}")
             self.stats['errors'] += 1
             return False
-    
+
     
     def needs_update(self, file_info: Dict, local_path: str) -> bool:
         """Dosyanin guncellenmesi gerekip gerekmediğini kontrol et"""
@@ -323,6 +364,7 @@ class GitHubSyncManager:
     def self_update(self) -> bool:
         """
         Uzakta yeni bir sürüm varsa indirir ve yereldeki dosyanın üzerine atomik yazma yapar.
+        Text dosyaları normalize edilir (utf-8, BOM kaldırma, newline '\n') ve onlara göre karşılaştırma yapılır.
         Eğer güncelleme yapılırsa process'i aynı argümanlarla yeniden başlatır (os.execv).
         Döner: True => güncelleme yapıldı (ve execv sonrası bu dönüş olmaz), False => değişiklik yok veya hata.
         """
@@ -331,21 +373,36 @@ class GitHubSyncManager:
             if not remote:
                 logger.debug("Self-update: remote içerik alınamadı veya bulunamadı.")
                 return False
-
             local_path = Path(__file__).resolve()
+            def normalize_bytes(b: bytes) -> bytes:
+                # Text dosyaları için decode denemeleri ve normalize -> utf-8 (BOM removed), newlines '\n'
+                if local_path.suffix.lower() in {'.bat','.cmd','.sh','.ps1','.py','.txt','.md','.json','.yaml','.yml','.html','.htm','.css','.js'}:
+                    for enc in ('utf-8-sig','utf-8','utf-16','latin-1'):
+                        try: return b.decode(enc).replace('\r\n', '\n').replace('\r', '\n').encode('utf-8')
+                        except Exception: continue
+                    return b
+                else: return b
+
+            # Normalize remote bytes for comparison/writing if applicable
+            try: normalized_remote = normalize_bytes(remote)
+            except Exception: normalized_remote = remote
+            # Read and normalize local if exists
             try:
-                with open(local_path, "rb") as f: local = f.read()
+                with open(local_path, "rb") as f:  local = f.read()
             except Exception as e:
                 logger.warning(f"Self-update: local dosya okunamadi: {e}")
                 local = b""
-            remote_hash = hashlib.sha256(remote).hexdigest()
-            local_hash = hashlib.sha256(local).hexdigest() if local else None
+            try: normalized_local = normalize_bytes(local) if local else None
+            except Exception: normalized_local = local
+            # Compare normalized content hashes
+            remote_hash = hashlib.sha256(normalized_remote).hexdigest()
+            local_hash = hashlib.sha256(normalized_local).hexdigest() if normalized_local else None
             if local_hash == remote_hash:
-                logger.debug("Self-update: zaten güncel.")
+                logger.debug("Self-update: zaten güncel (normalize edilmiş içerik aynı).")
                 return False
             parent = local_path.parent
             with tempfile.NamedTemporaryFile(delete=False, dir=str(parent)) as tmp:
-                tmp.write(remote)
+                tmp.write(normalized_remote)
                 tmp_path = Path(tmp.name)
             shutil.move(str(tmp_path), str(local_path))
             logger.info("Self-update: script güncellendi. Şimdi yeniden başlatılıyor...")
