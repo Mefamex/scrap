@@ -256,7 +256,7 @@ class BrowserManager:
             return False
         try:
             if not self.is_initialized: await self.initialize_browser()
-            timeout = timeout or settings.browser_timeout
+            timeout = timeout or settings.browser_timeout or 60
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self.driver.get, url)
             # Sayfa yüklenene kadar bekle

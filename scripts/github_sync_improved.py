@@ -67,7 +67,13 @@ else: logging.basicConfig(level=logging.INFO, handlers=[stream_handler])
 logger = logging.getLogger(__name__)
 
 
-
+def detect_newline_bytes(bb: bytes) -> Optional[str]:
+    """Byte dizisinde hangi newline stilinin kullanıldığını tespit et.
+    return: '\r\n' veya '\n' veya '\r' ya da None. """
+    if b'\r\n' in bb: return '\r\n'
+    if b'\n' in bb: return '\n'
+    if b'\r' in bb: return '\r'
+    return None
 
 class GitHubSyncConfig:
     """Yapilandirma sinifi"""
@@ -282,24 +288,45 @@ class GitHubSyncManager:
                     size = tmp_path.stat().st_size
                     if size <= MAX_TEXT_SIZE:
                         b = tmp_path.read_bytes()
-                        decoded = None
+                        # Uzaktaki içeriği çözüp normalize edilmiş temsilini al
+                        decoded_remote = None
                         for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'latin-1'):
                             try:
                                 s = b.decode(enc)
                                 if '\x00' in s:
-                                    decoded = None
-                                    continue
-                                decoded = s.replace('\r\n', '\n').replace('\r', '\n')
+                                    decoded_remote = None
+                                    break
+                                decoded_remote = s
                                 break
-                            except Exception: decoded = None
-                        if decoded is not None:
-                            tmp_path.write_text(decoded, encoding='utf-8', newline='\n')
+                            except Exception: decoded_remote = None
+                        # Eğer hem uzak hem yerel metin çözülebiliyorsa, normalize edilmiş halleri karşılaştır
+                        if decoded_remote is not None and local_path_p.exists():
                             try:
-                                with open(tmp_path, 'rb') as ftmp: os.fsync(ftmp.fileno())
-                            except Exception: pass
+                                local_b = local_path_p.read_bytes()
+                                decoded_local = None
+                                for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'latin-1'):
+                                    try:
+                                        sl = local_b.decode(enc)
+                                        if '\x00' in sl:
+                                            decoded_local = None
+                                            break
+                                        decoded_local = sl
+                                        break
+                                    except Exception: decoded_local = None
+                                if decoded_local is not None:
+                                    norm_remote = decoded_remote.replace('\r\n', '\n').replace('\r', '\n')
+                                    norm_local = decoded_local.replace('\r\n', '\n').replace('\r', '\n')
+                                    if norm_remote == norm_local:
+                                        # Sadece newline veya BOM farkı var — yereldeki dosyayı koru
+                                        try: tmp_path.unlink()
+                                        except Exception: pass
+                                        logger.debug(f"Atlandi (sadece newline/BOM farkı): {local_path_p}")
+                                        return False
+                            except Exception:  pass
+                        # Diğer durumlarda uzak baytları olduğu gibi bırak (normalize etmiyoruz),
+                        # yani tmp dosyası zaten uzakın ham bytes'ını içeriyor ve sonrasında atomik replace yapılacak.
                     else: logger.debug(f"Normalize atlandi (büyük dosya): {tmp_path} ({size} bytes)")
-            except Exception as e:
-                logger.debug(f"Normalize adımında hata (devam ediyor): {e}")
+            except Exception as e: logger.debug(f"Normalize adımında hata (devam ediyor): {e}")
             try: # Atomik taşıma ve izin koruma
                 prev_mode = None 
                 if local_path_p.exists():
@@ -434,12 +461,32 @@ class GitHubSyncManager:
             candidates = [f"scripts/{Path(__file__).name}", Path(__file__).name]
             local_path = Path(__file__).resolve()
             def normalize_bytes(b: bytes) -> bytes:
-                if local_path.suffix.lower() in {'.bat','.cmd','.sh','.ps1','.py','.txt','.md','.json','.yaml','.yml','.html','.htm','.css','.js'}:
+                # Özel korunacak dosyalar (isteğe bağlı)
+                PRESERVE_FILENAMES = {'.gitignore', '.gitattributes', '.editorconfig'}
+                local_name = local_path.name.lower() if local_path is not None else ""
+                if local_name in PRESERVE_FILENAMES: return b  # hiç değiştirme
+                # Metin uzantıları için decode-et ve yerel stil varsa ona göre dönüştür
+                if local_path.suffix.lower() in {'.bat', '.cmd', '.sh', '.ps1', '.py', '.txt', '.md', '.json', '.yaml', '.yml', '.html', '.htm', '.css', '.js'}:
                     for enc in ('utf-8-sig','utf-8','utf-16','latin-1'):
                         try:
-                            s = b.decode(enc)
-                            s = s.replace('\r\n', '\n').replace('\r', '\n')
-                            return s.encode('utf-8')
+                            s = b.decode(enc) # binary gibi görünüyorsa vazgeç
+                            if '\x00' in s:  return b
+                            out_newline = None # hedef newline: eğer yerelde dosya varsa onun stilini koru
+                            try:
+                                if local_path.exists():
+                                    local_b = local_path.read_bytes()
+                                    ln_local = detect_newline_bytes(local_b)
+                                    if ln_local: out_newline = ln_local
+                            except Exception: out_newline = None 
+                            ln_remote = detect_newline_bytes(b) # fallback: uzak içeriğin stili
+                            if out_newline is None: out_newline = ln_remote or '\n'
+                            norm_s = s.replace('\r\n', '\n').replace('\r', '\n') # normalize iç ve tekrar encode (utf-8); BOM kaldırılır (utf-8)
+                            try:
+                                # encode with intended newline by writing to bytes via .encode after normalizing newlines
+                                # but ensure newline bytes match out_newline
+                                if out_newline != '\n': norm_s = norm_s.replace('\n', out_newline)
+                                return norm_s.encode('utf-8')
+                            except Exception: return b
                         except Exception: continue
                     return b
                 return b

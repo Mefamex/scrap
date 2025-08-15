@@ -43,3 +43,4 @@ if __name__ == "__main__":
         logging.critical(f"Kritik Hata (run.py): {e}", exc_info=True)
     finally:
         print("Uygulama sonlandı.")
+

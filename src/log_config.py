@@ -36,3 +36,4 @@ def setup_logging():
     logger.addHandler(file_handler)
 
     logging.info("Loglama yapılandırması tamamlandı.")
+

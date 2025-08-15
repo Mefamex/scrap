@@ -8,16 +8,7 @@ from src.browser_manager import browser_manager  # DÜZELTİLDİ (eskiden: from 
 
 logger = logging.getLogger("scrap.scrap_page")
 
-def _get_or_create_driver():
-    """
-    Mevcut Selenium driver'ı döner.
-    (sync fonksiyon içinde await edemeyeceğimiz için burada initialize etmiyoruz;
-    main zaten initialize_browser çağırıyor. Hazır değilse None döner.)
-    """
-    if not getattr(browser_manager, "is_initialized", False):
-        logger.debug("Browser manager henüz initialize edilmemiş; requests fallback kullanılacak.")
-        return None
-    return getattr(browser_manager, "driver", None)
+
 
 def _fetch_with_browser(driver, url: str, timeout: int, headers: dict) -> Optional[str]:
     try:

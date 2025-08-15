@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     
     # Chrome/ChromeDriver Ayarları
     chrome_binary_path: Optional[str] = None
-    chromedriver_path: str = str(Path(app_base_dir) / "chromedriver.exe")
+    chromedriver_path: str = str(Path(app_base_dir) / "src" / "chromedriver.exe")
 
     # Güvenlik
     allowed_domains: List[str] = []

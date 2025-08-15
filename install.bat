@@ -100,3 +100,4 @@ echo BU PENCEREYI KAPAT !!!
 echo.
 pause
 exit /b 0
+
