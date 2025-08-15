@@ -2,3 +2,4 @@
 chrome_profiles/
 __pycache__/
 logs/
+.syncmeta.json

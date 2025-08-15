@@ -33,7 +33,7 @@ DEF_GITHUB_BRANCH: str = "main"
 DEF_LOG_PATH     : str = str(Path(__file__).resolve().parent.parent / "logs" / "github_sync.log")
 #OPSIYONELLER
 DEF_GITHUB_TOKEN : str = ""    # rate limit icin
-DEF_IGNORE_PTRN  : List[str] = [".git", ".venv"] # [".git", "__pycache__", "*.pyc", ".env", ".venv"]
+DEF_IGNORE_PTRN  : List[str] = [".git", ".venv", ".syncmeta.json"] # [".git", "__pycache__", "*.pyc", ".env", ".venv"]
 DEF_MAX_WORKERS  : int = 4
 DEF_RETRY_COUNT  : int = 3
 DEF_TIMEOUT      : int = 30
