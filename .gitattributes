@@ -1,0 +1,15 @@
+# Default: repoda normalize LF, Windows checkout'ta CRLF
+* text=auto eol=crlf
+
+# Shell scriptler LF kalsın (bash, posix)
+*.sh text eol=lf
+
+# Windows komut dosyaları kesin CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Açıkça binary dosyalar
+*.png binary
+*.jpg binary
+*.exe binary
+*.zip binary
