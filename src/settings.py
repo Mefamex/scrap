@@ -82,26 +82,68 @@ class Settings(BaseSettings):
 def _get_chrome_driver_path() -> str:
     """ChromeDriver'ın yolunu kontrol et veya indir."""
     chromedriver_path = Path(settings.chromedriver_path)
+    # Tarayıcı sürümünü erken al (mismatch kontrolü için)
+    try:
+        detected_browser_version = _get_chrome_version(settings.chrome_binary_path)
+    except Exception:
+        detected_browser_version = None
+    need_download = True
     if chromedriver_path.exists():
-        # chrome Driver bu projenin dizininde mi ?
-        if chromedriver_path.parent == Path(settings.app_base_dir) or chromedriver_path.parent == Path(settings.app_base_dir) / "src" : print(f"✅ Kendimizin Chrome'u bulundu: {chromedriver_path}")
-        else: print(f"❌ Başka bir ChromeDriver bulundu: {chromedriver_path}")
-        return str(chromedriver_path)
+        need_download = False
+        if chromedriver_path.parent in (Path(settings.app_base_dir), Path(settings.app_base_dir) / "src"):
+            print(f"✅ Mevcut ChromeDriver bulundu: {chromedriver_path}")
+        else:
+            print(f"❌ Beklenmeyen konumda ChromeDriver bulundu: {chromedriver_path}")
+        drv_ver = _get_chromedriver_version(chromedriver_path)
+        if drv_ver:
+            print(f"Mevcut ChromeDriver sürümü: {drv_ver}")
+        if detected_browser_version and drv_ver:
+            if drv_ver.split('.')[0] != detected_browser_version.split('.')[0]:
+                print(f"⚠️ Sürüm uyumsuzluğu: Browser {detected_browser_version} vs Driver {drv_ver}. Yeniden indirilecek...")
+                try:
+                    chromedriver_path.unlink()
+                except Exception:
+                    pass
+                need_download = True
+        elif not detected_browser_version:
+            # Browser versiyonu bulunamadı, mevcut driver ile devam
+            if drv_ver:
+                return str(chromedriver_path)
+        if not need_download:
+            return str(chromedriver_path)
     else:
-        print("ChromeDriver bulunamadı, indiriliyor...")
+        print("ChromeDriver bulunamadı, indirilecek...")
+
+    # İndirme aşaması
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        detected = detected_browser_version or _get_chrome_version(settings.chrome_binary_path)
+        driver_path = None
+        if detected:
+            try:
+                parts = [p for p in str(detected).split('.') if p.isdigit()]
+                norm = ".".join(parts[:3]) if len(parts) >= 3 else detected
+                print(f"Chrome sürümü algılandı: {detected} -> normalize: {norm}. Uygun ChromeDriver indiriliyor...")
+                driver_path = ChromeDriverManager(driver_version=norm).install()
+            except Exception as e:
+                print(f"Belirli sürümle indirme başarısız: {e}. Otomatik seçim deneniyor...")
+                driver_path = ChromeDriverManager().install()
+        else:
+            driver_path = ChromeDriverManager().install()
+        print(f"✅ ChromeDriver indirildi: {driver_path}")
+        target_path = Path(settings.chromedriver_path)
         try:
-            from webdriver_manager.chrome import ChromeDriverManager
-            driver_path = ChromeDriverManager(driver_version="137.0.7151.119").install()
-            print(f"✅ ChromeDriver indirildi: {driver_path}")
-            # ChromeDriver'ı proje ana dizinine taşı
-            target_path = Path(settings.chromedriver_path)
-            shutil.move(driver_path, target_path)
-            print(f"✅ ChromeDriver taşındı: {target_path}")
-            return str(target_path)
-        except Exception as e:
-            print(f"❌ ChromeDriver indirilemedi: {e}")
-            print("Program sonlandırılıyor...")
-            sys.exit(1)
+            if target_path.exists():
+                target_path.unlink()
+        except Exception:
+            pass
+        shutil.move(driver_path, target_path)
+        print(f"✅ ChromeDriver taşındı: {target_path}")
+        return str(target_path)
+    except Exception as e:
+        print(f"❌ ChromeDriver indirilemedi: {e}")
+        print("Program sonlandırılıyor...")
+        sys.exit(1)
 
 
 
@@ -132,29 +174,33 @@ def _get_chrome_version(explicit_path: Optional[str]) -> Optional[str]:
     """Chrome sürümünü dizinden veya komutla algılar."""
     paths = []
     if explicit_path: paths.append(Path(explicit_path))
-    paths.extend(_candidate_chrome_paths())
-
+    candidates = list(_candidate_chrome_paths())
+    print(f"Algılanan Chrome yolları: {candidates}")
+    paths.extend(candidates)
     for p in paths:
         if not p or not p.exists(): continue
         try:
-            version_dirs = []
-            for root, dirs, files in os.walk(p.parent):
-                for d in dirs:
-                    if re.match(r"^\d+\.\d+\.\d+\.\d+$", d):
-                        version_dirs.append(d)
-            if version_dirs: return version_dirs[0]
-            version_dir = p.parent / "137.0.7151.104"
-            if version_dir.exists(): return version_dir.name
-
-            # Eğer dizinden sürüm bulunamazsa, komutla kontrol et
+            # Doğrudan chrome --version komutu ile dene
             proc = subprocess.run([str(p), "--version"], capture_output=True, text=True, timeout=5)
             out = (proc.stdout or proc.stderr or "").strip()
             ver = _extract_version(out)
-            if ver:
-                return ver
+            if ver: return ver
         except Exception:
             continue
     return None
+
+def _get_chromedriver_version(driver_path: Path) -> Optional[str]:
+    """chromedriver --version çıktısından sürümü al."""
+    if not driver_path or not driver_path.exists():
+        return None
+    try:
+        proc = subprocess.run([str(driver_path), "--version"], capture_output=True, text=True, timeout=5)
+        out = (proc.stdout or proc.stderr or "").strip()
+        # Ör: 'ChromeDriver 137.0.7151.119 ...'
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", out)
+        return m.group(1) if m else None
+    except Exception:
+        return None
 
 def _build_user_agent(version: str) -> str:
     # Windows NT kısmını platforma göre uyarlayabilirsin; şimdilik sabit Windows UA formatı.
